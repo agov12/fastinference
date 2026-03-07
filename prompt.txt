@@ -1,0 +1,137 @@
+I want you to write a single Python benchmarking script for LLM inference on a single NVIDIA A100 GPU using Hugging Face Transformers and PyTorch. The A100 GPU is on Azure
+
+Goal:
+Build a reproducible baseline benchmark that:
+1. Runs plain Hugging Face `model.generate()` inference.
+2. Measures total latency, prefill latency, and decode latency separately.
+3. Reports tokens/sec for decode and end-to-end generation.
+4. Supports both batch size 1 and batch size 16.
+5. Supports bf16 and fp16.
+6. Has an optional mode meant to be launched under `nsys profile` so I can capture a short trace during decode.
+7. Prints a clean summary table at the end.
+
+Important:
+- Do NOT use vLLM, TensorRT-LLM, or any special inference engine.
+- Use standard Hugging Face Transformers + PyTorch only.
+- Assume a causal decoder-only model.
+- Make the script robust and readable, with comments.
+- Minimize dependencies.
+
+Use this default model unless I override it by CLI flag:
+- Qwen/Qwen3-8B
+If gated access makes this inconvenient, make the model configurable and default to a commonly available decoder-only instruct model.
+
+What the script should do:
+- Load tokenizer and model from Hugging Face.
+- Put model on CUDA.
+- Allow dtype selection from CLI: `--dtype bf16` or `--dtype fp16`.
+- Accept CLI args:
+  - `--model`
+  - `--dtype`
+  - `--batch-size`
+  - `--prompt-len`
+  - `--max-new-tokens`
+  - `--warmup-iters`
+  - `--benchmark-iters`
+  - `--seed`
+  - `--profile-decode` (boolean)
+  - `--output-json` (optional path)
+- Generate a synthetic prompt of approximately the requested token length, rather than relying on a hardcoded natural-language paragraph.
+- Ensure the tokenizer output is padded correctly for batch inference.
+- Use deterministic generation settings:
+  - `do_sample=False`
+  - greedy decoding only
+- Make sure `use_cache=True`.
+
+Timing requirements:
+I want three timing measurements:
+1. Prefill time:
+   - Time a single forward pass over the full prompt with `use_cache=True`
+   - This should produce the KV cache / past_key_values for the prompt
+2. Decode time:
+   - Starting from the cached prompt state, generate `max_new_tokens` one token at a time in a manual loop
+   - Reuse the KV cache / past_key_values
+   - For each step, feed only the newest token
+   - Measure the total decode time across all generated tokens
+3. End-to-end `model.generate()` time:
+   - Time plain Hugging Face `model.generate()` separately for comparison
+
+Do NOT estimate prefill by subtraction only. I want an actual explicit prefill timing and an explicit manual decode timing.
+
+Implementation details:
+- Use `torch.cuda.Event(enable_timing=True)` for accurate GPU timing.
+- Also call `torch.cuda.synchronize()` at the right times so timings are correct.
+- Wrap inference in `torch.no_grad()`.
+- Set model to eval mode.
+- In the manual decode loop:
+  - Start from the prompt forward pass outputs
+  - Get logits for the last token
+  - Pick the argmax token
+  - Feed that token back in for the next step
+  - Reuse `past_key_values`
+- Report:
+  - prefill_ms
+  - decode_ms
+  - total_generate_ms
+  - decode_tokens_per_sec
+  - end_to_end_tokens_per_sec
+  - prompt_tokens
+  - generated_tokens
+  - batch_size
+  - dtype
+  - model_name
+  - max GPU memory allocated if possible
+
+Benchmark methodology:
+- Run a few warmup iterations first.
+- Then run benchmark iterations and average results.
+- Print per-iteration metrics and final averages.
+- Handle OOM errors gracefully and print a useful message.
+
+Synthetic prompt generation:
+- Create a repeated tokenizable text pattern and tokenize it.
+- Trim or extend until it is as close as possible to `prompt_len`.
+- Make sure this works for batch_size > 1.
+
+Profiling mode:
+- Add a mode intended for Nsight Systems profiling.
+- If `--profile-decode` is passed, the script should:
+  - Run one short warmup
+  - Then run one manual prefill + manual decode pass only
+  - Print clear markers to stdout like:
+    - START_PREFILL
+    - END_PREFILL
+    - START_DECODE
+    - END_DECODE
+- Keep the profiled run short and clean so it is easy to inspect in `nsys`.
+- The script itself does not need to invoke nsys, but print example commands in comments at the top, such as:
+  - batch size 1 profile command
+  - batch size 16 profile command
+
+Please also provide:
+1. A `requirements.txt`
+2. Example shell commands to run:
+   - bf16 batch=1 baseline
+   - bf16 batch=16 baseline
+   - fp16 batch=1 baseline
+   - nsys profile for batch=1 decode
+   - nsys profile for batch=16 decode
+
+Coding quality requirements:
+- Python 3.10+
+- Clear functions:
+  - load_model_and_tokenizer()
+  - make_synthetic_batch()
+  - time_prefill()
+  - time_manual_decode()
+  - time_generate()
+  - summarize_results()
+  - main()
+- Add helpful comments explaining why each timing method is done this way.
+- Make the code production-quality enough that I can immediately run it on a GCP A100 VM.
+
+At the very end, briefly explain:
+- what prefill means
+- what decode means
+- why decode is often memory-bandwidth bound
+- how I should interpret the difference between manual prefill/decode timings and `model.generate()` timing
