@@ -418,6 +418,9 @@ def _build_arg_parser():
 
 
 def run_hf_benchmark(args) -> list[IterationMetrics]:
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+
     try:
         model, tokenizer = load_hf_model_and_tokenizer(args.model, args.dtype)
         prompt_token_ids = make_synthetic_prompt_ids(tokenizer, args.prompt_len)
@@ -659,9 +662,6 @@ def run_vllm_benchmark(args) -> list[IterationMetrics]:
 
 def main():
     args = _build_arg_parser().parse_args()
-
-    torch.manual_seed(args.seed)
-    torch.cuda.manual_seed_all(args.seed)
 
     if args.backend == "hf":
         metrics_list = run_hf_benchmark(args)
