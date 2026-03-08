@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import statistics
 import sys
 import time
@@ -291,6 +292,55 @@ def extract_vllm_generated_tokens(outputs) -> tuple[int, int]:
     else:
         generated_tokens = int(round(statistics.mean(per_request_counts)))
     return generated_tokens, sum(per_request_counts)
+
+
+def _find_child_process_ids() -> set[int]:
+    try:
+        import psutil
+    except ImportError:
+        return set()
+
+    try:
+        return {child.pid for child in psutil.Process().children(recursive=True)}
+    except psutil.Error:
+        return set()
+
+
+def get_vllm_worker_memory_gb() -> float | None:
+    worker_pids = _find_child_process_ids()
+    if not worker_pids:
+        return None
+
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-compute-apps=pid,used_gpu_memory",
+                "--format=csv,noheader,nounits",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return None
+
+    total_mib = 0.0
+    for line in result.stdout.splitlines():
+        parts = [part.strip() for part in line.split(",", maxsplit=1)]
+        if len(parts) != 2:
+            continue
+        try:
+            pid = int(parts[0])
+            used_mib = float(parts[1])
+        except ValueError:
+            continue
+        if pid in worker_pids:
+            total_mib += used_mib
+
+    if total_mib <= 0:
+        return None
+    return total_mib / 1024.0
 
 
 def _mean_or_none(values: list[float | None]) -> float | None:
@@ -627,6 +677,7 @@ def run_vllm_benchmark(args) -> list[IterationMetrics]:
             raise
 
     metrics_list: list[IterationMetrics] = []
+    max_observed_mem_gb: float | None = get_vllm_worker_memory_gb()
 
     for i in range(args.benchmark_iters):
         try:
@@ -634,7 +685,13 @@ def run_vllm_benchmark(args) -> list[IterationMetrics]:
             gen_ms, outputs = time_vllm_generate(llm, prompts, benchmark_params)
             generated_tokens, total_generated_tokens = extract_vllm_generated_tokens(outputs)
             e2e_tok_s = total_generated_tokens / (gen_ms / 1000.0) if gen_ms > 0 else 0.0
-            max_mem_gb = torch.cuda.max_memory_allocated() / (1024**3)
+            current_mem_gb = get_vllm_worker_memory_gb()
+            if current_mem_gb is not None:
+                max_observed_mem_gb = (
+                    current_mem_gb
+                    if max_observed_mem_gb is None
+                    else max(max_observed_mem_gb, current_mem_gb)
+                )
 
             iter_metrics = IterationMetrics(
                 backend="vllm",
@@ -648,7 +705,7 @@ def run_vllm_benchmark(args) -> list[IterationMetrics]:
                 batch_size=args.batch_size,
                 dtype=args.dtype,
                 model_name=args.model,
-                max_gpu_mem_gb=max_mem_gb,
+                max_gpu_mem_gb=max_observed_mem_gb,
             )
             metrics_list.append(iter_metrics)
             _print_iteration(i + 1, iter_metrics)
