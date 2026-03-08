@@ -1,0 +1,9 @@
+backend,model_name,dtype,batch_size,prompt_tokens,generated_tokens,prefill_ms,decode_ms,total_generate_ms,decode_tokens_per_sec,end_to_end_tokens_per_sec,generated_tok_s_per_gpu,total_processed_tok_s_per_gpu,max_gpu_mem_gb,source_json
+vllm,Qwen/Qwen2.5-7B-Instruct,bf16,16,1024,128,,,2578.6073070019484,,794.2273762091402,794.2271762120826,7148.044585908743,37.0859375,vllm_qwen2.5-7b-instruct_bf16_bs16_prompt1024_gen128.json
+vllm,Qwen/Qwen2.5-7B-Instruct,bf16,1,1024,128,,,1635.3969474090263,,78.26846443392455,78.2684596561046,704.4161369049414,36.21875,vllm_qwen2.5-7b-instruct_bf16_bs1_prompt1024_gen128.json
+vllm,Qwen/Qwen2.5-7B-Instruct,bf16,1,128,128,,,1577.110856026411,,81.16106729738627,81.16106709359715,162.3221341871943,36.21875,vllm_qwen2.5-7b-instruct_bf16_bs1_prompt128_gen128.json
+vllm,Qwen/Qwen2.5-7B-Instruct,bf16,1,16384,128,,,2836.4269664045423,,45.12720292663124,45.12719753269478,5821.408481717626,37.0859375,vllm_qwen2.5-7b-instruct_bf16_bs1_prompt16384_gen128.json
+vllm,Qwen/Qwen2.5-7B-Instruct,bf16,1,4096,128,,,1832.8262754250318,,69.83749881574849,69.83749726651908,2304.6374097951298,36.5078125,vllm_qwen2.5-7b-instruct_bf16_bs1_prompt4096_gen128.json
+vllm,Qwen/Qwen2.5-7B-Instruct,bf16,2,1024,128,,,1650.2934945747256,,155.12741467601447,155.12392240628097,1396.1153016565288,36.21875,vllm_qwen2.5-7b-instruct_bf16_bs2_prompt1024_gen128.json
+vllm,Qwen/Qwen2.5-7B-Instruct,bf16,4,1024,128,,,1774.9177732039243,,288.4641064377997,288.4640673104439,2596.176605793995,36.4375,vllm_qwen2.5-7b-instruct_bf16_bs4_prompt1024_gen128.json
+vllm,Qwen/Qwen2.5-7B-Instruct,bf16,8,1024,128,,,2060.289166192524,,497.01775135718844,497.0176113153973,4473.158501838576,37.640625,vllm_qwen2.5-7b-instruct_bf16_bs8_prompt1024_gen128.json
