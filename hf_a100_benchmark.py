@@ -26,9 +26,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import statistics
 import sys
 import time
+import multiprocessing as mp
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -84,9 +86,6 @@ def load_hf_model_and_tokenizer(model_name: str, dtype: str):
 
 
 def load_vllm_engine_and_tokenizer(args):
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is required for this benchmark, but no GPU was detected.")
-
     try:
         from vllm import LLM
     except ImportError as exc:
@@ -576,6 +575,13 @@ def run_vllm_benchmark(args) -> list[IterationMetrics]:
     if args.profile_decode:
         print("--profile-decode is only supported with --backend hf.", file=sys.stderr)
         sys.exit(2)
+
+    os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    try:
+        mp.set_start_method("spawn", force=True)
+    except RuntimeError:
+        # Another library may have already fixed the start method in this process.
+        pass
 
     try:
         llm, tokenizer = load_vllm_engine_and_tokenizer(args)
