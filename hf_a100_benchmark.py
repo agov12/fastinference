@@ -5,12 +5,15 @@ LLM inference benchmark for a single NVIDIA A100.
 Supported backends:
   - Hugging Face Transformers + PyTorch
   - vLLM offline engine
+  - TensorRT-LLM Python LLM API
 
 Example baseline runs:
   python hf_a100_benchmark.py --backend hf --dtype bf16 --batch-size 1
   python hf_a100_benchmark.py --backend hf --dtype bf16 --batch-size 16
   python hf_a100_benchmark.py --backend vllm --dtype bf16 --batch-size 1
   python hf_a100_benchmark.py --backend vllm --dtype bf16 --batch-size 16
+  python hf_a100_benchmark.py --backend trtllm --dtype bf16 --batch-size 1
+  python hf_a100_benchmark.py --backend trtllm --dtype bf16 --batch-size 16
 
 Example Nsight Systems profile runs (HF decode-focused only):
   nsys profile -o nsys_bs1_decode --trace=cuda,nvtx \
@@ -113,6 +116,99 @@ def load_vllm_engine_and_tokenizer(args):
         llm_kwargs["max_model_len"] = args.vllm_max_model_len
 
     llm = LLM(**llm_kwargs)
+    tokenizer = load_tokenizer(args.model)
+    return llm, tokenizer
+
+
+def _site_packages_dir() -> Path:
+    return Path(sys.prefix) / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
+
+
+def _prepend_env_path(var_name: str, paths: list[Path]) -> None:
+    existing = os.environ.get(var_name, "")
+    ordered = [str(path) for path in paths if path.exists()]
+    if existing:
+        ordered.append(existing)
+    if ordered:
+        os.environ[var_name] = ":".join(ordered)
+
+
+def _ensure_symlink(link_path: Path, target: Path) -> None:
+    if link_path.exists() or link_path.is_symlink():
+        return
+    try:
+        link_path.symlink_to(target)
+    except OSError:
+        # Best-effort only: if the environment is read-only, rely on the
+        # caller to provide a system CUDA install instead.
+        pass
+
+
+def configure_trtllm_runtime_environment() -> Path | None:
+    site_packages = _site_packages_dir()
+    detected_cuda_home = site_packages / "nvidia" / "cu13"
+    cuda_home = Path(os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH") or detected_cuda_home)
+    if cuda_home.exists():
+        os.environ["CUDA_HOME"] = str(cuda_home)
+        os.environ["CUDA_PATH"] = str(cuda_home)
+
+        cuda_lib_dir = cuda_home / "lib"
+        cuda_lib64_dir = cuda_home / "lib64"
+        if cuda_lib_dir.exists():
+            _ensure_symlink(cuda_lib64_dir, cuda_lib_dir)
+            libcudart_major = next(cuda_lib_dir.glob("libcudart.so.*"), None)
+            if libcudart_major is not None:
+                _ensure_symlink(cuda_lib_dir / "libcudart.so", Path(libcudart_major.name))
+
+    ld_library_paths: list[Path] = []
+    nvidia_root = site_packages / "nvidia"
+    if nvidia_root.exists():
+        ld_library_paths.extend(sorted(nvidia_root.glob("*/lib")))
+
+    tensorrt_libs_dir = site_packages / "tensorrt_libs"
+    if tensorrt_libs_dir.exists():
+        ld_library_paths.insert(0, tensorrt_libs_dir)
+
+    _prepend_env_path("LD_LIBRARY_PATH", ld_library_paths)
+    return cuda_home if cuda_home.exists() else None
+
+
+def ensure_trtllm_runtime_ready_for_current_process() -> None:
+    configure_trtllm_runtime_environment()
+    if os.environ.get("_TRTLLM_ENV_READY") == "1":
+        return
+
+    os.environ["_TRTLLM_ENV_READY"] = "1"
+    os.execvpe(sys.executable, [sys.executable, *sys.argv], os.environ)
+
+
+def load_trtllm_engine_and_tokenizer(args):
+    cuda_home = configure_trtllm_runtime_environment()
+    try:
+        from tensorrt_llm import LLM
+    except ImportError as exc:
+        raise RuntimeError(
+            "TensorRT-LLM backend requested, but the 'tensorrt_llm' package is not installed."
+        ) from exc
+
+    dtype_map = {"bf16": "bfloat16", "fp16": "float16"}
+    if args.dtype not in dtype_map:
+        raise ValueError(f"Unsupported dtype '{args.dtype}'. Use one of: {list(dtype_map)}")
+    if cuda_home is None:
+        raise RuntimeError(
+            "TensorRT-LLM requires CUDA_HOME/CUDA_PATH or a pip-installed CUDA 13 toolkit."
+        )
+
+    llm = LLM(
+        model=args.model,
+        tokenizer=args.model,
+        dtype=dtype_map[args.dtype],
+        tensor_parallel_size=1,
+        trust_remote_code=False,
+        max_batch_size=args.batch_size,
+        max_num_tokens=args.prompt_len + args.max_new_tokens,
+        max_seq_len=args.prompt_len + args.max_new_tokens,
+    )
     tokenizer = load_tokenizer(args.model)
     return llm, tokenizer
 
@@ -270,10 +366,33 @@ def build_vllm_sampling_params(max_new_tokens: int, seed: int):
     )
 
 
+def build_trtllm_sampling_params(max_new_tokens: int, seed: int):
+    try:
+        from tensorrt_llm import SamplingParams
+    except ImportError as exc:
+        raise RuntimeError(
+            "TensorRT-LLM backend requested, but the 'tensorrt_llm' package is not installed."
+        ) from exc
+
+    return SamplingParams(
+        max_tokens=max_new_tokens,
+        temperature=0.0,
+        top_k=1,
+        top_p=1.0,
+        seed=seed,
+        detokenize=False,
+        return_perf_metrics=True,
+    )
+
+
 def time_vllm_generate(llm, prompts, sampling_params):
     return _time_host_callable(
         lambda: llm.generate(prompts, sampling_params=sampling_params, use_tqdm=False)
     )
+
+
+def time_trtllm_generate(llm, prompts, sampling_params):
+    return _time_host_callable(lambda: llm.generate(prompts, sampling_params=sampling_params))
 
 
 def extract_vllm_generated_tokens(outputs) -> tuple[int, int]:
@@ -294,6 +413,66 @@ def extract_vllm_generated_tokens(outputs) -> tuple[int, int]:
     return generated_tokens, sum(per_request_counts)
 
 
+def extract_trtllm_generated_tokens(outputs) -> tuple[int, int]:
+    per_request_counts = []
+    for output in outputs:
+        completion_outputs = getattr(output, "outputs", [])
+        if not completion_outputs:
+            per_request_counts.append(0)
+            continue
+        per_request_counts.append(len(getattr(completion_outputs[0], "token_ids", [])))
+
+    if not per_request_counts:
+        return 0, 0
+
+    if all(count == per_request_counts[0] for count in per_request_counts):
+        generated_tokens = per_request_counts[0]
+    else:
+        generated_tokens = int(round(statistics.mean(per_request_counts)))
+    return generated_tokens, sum(per_request_counts)
+
+
+def _timedelta_ms(value) -> float | None:
+    if value is None:
+        return None
+    total_seconds = getattr(value, "total_seconds", None)
+    if total_seconds is None:
+        return None
+    return total_seconds() * 1000.0
+
+
+def extract_trtllm_phase_timings(outputs) -> tuple[float | None, float | None]:
+    arrivals = []
+    first_tokens = []
+    last_tokens = []
+
+    for output in outputs:
+        completion_outputs = getattr(output, "outputs", [])
+        if not completion_outputs:
+            continue
+        perf_metrics = getattr(completion_outputs[0], "request_perf_metrics", None)
+        timing_metrics = getattr(perf_metrics, "timing_metrics", None)
+        if timing_metrics is None:
+            continue
+
+        arrival_ms = _timedelta_ms(getattr(timing_metrics, "arrival_time", None))
+        first_token_ms = _timedelta_ms(getattr(timing_metrics, "first_token_time", None))
+        last_token_ms = _timedelta_ms(getattr(timing_metrics, "last_token_time", None))
+        if arrival_ms is None or first_token_ms is None or last_token_ms is None:
+            continue
+
+        arrivals.append(arrival_ms)
+        first_tokens.append(first_token_ms)
+        last_tokens.append(last_token_ms)
+
+    if not arrivals or not first_tokens or not last_tokens:
+        return None, None
+
+    prefill_ms = max(first_tokens) - min(arrivals)
+    decode_ms = max(last_tokens) - min(first_tokens)
+    return prefill_ms, decode_ms
+
+
 def _find_child_process_ids() -> set[int]:
     try:
         import psutil
@@ -306,7 +485,7 @@ def _find_child_process_ids() -> set[int]:
         return set()
 
 
-def get_vllm_worker_memory_gb() -> float | None:
+def get_child_worker_memory_gb() -> float | None:
     worker_pids = _find_child_process_ids()
     if not worker_pids:
         return None
@@ -426,7 +605,7 @@ def _print_summary(summary: IterationMetrics):
 
 def _build_arg_parser():
     parser = argparse.ArgumentParser(description="LLM inference benchmark on a single GPU")
-    parser.add_argument("--backend", type=str, default="hf", choices=["hf", "vllm"])
+    parser.add_argument("--backend", type=str, default="hf", choices=["hf", "vllm", "trtllm"])
     parser.add_argument("--model", type=str, default=DEFAULT_MODEL)
     parser.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16"])
     parser.add_argument("--batch-size", type=int, default=1)
@@ -677,7 +856,7 @@ def run_vllm_benchmark(args) -> list[IterationMetrics]:
             raise
 
     metrics_list: list[IterationMetrics] = []
-    max_observed_mem_gb: float | None = get_vllm_worker_memory_gb()
+    max_observed_mem_gb: float | None = get_child_worker_memory_gb()
 
     for i in range(args.benchmark_iters):
         try:
@@ -685,7 +864,7 @@ def run_vllm_benchmark(args) -> list[IterationMetrics]:
             gen_ms, outputs = time_vllm_generate(llm, prompts, benchmark_params)
             generated_tokens, total_generated_tokens = extract_vllm_generated_tokens(outputs)
             e2e_tok_s = total_generated_tokens / (gen_ms / 1000.0) if gen_ms > 0 else 0.0
-            current_mem_gb = get_vllm_worker_memory_gb()
+            current_mem_gb = get_child_worker_memory_gb()
             if current_mem_gb is not None:
                 max_observed_mem_gb = (
                     current_mem_gb
@@ -723,6 +902,107 @@ def run_vllm_benchmark(args) -> list[IterationMetrics]:
     return metrics_list
 
 
+def run_trtllm_benchmark(args) -> list[IterationMetrics]:
+    if args.profile_decode:
+        print("--profile-decode is only supported with --backend hf.", file=sys.stderr)
+        sys.exit(2)
+
+    ensure_trtllm_runtime_ready_for_current_process()
+
+    try:
+        llm, tokenizer = load_trtllm_engine_and_tokenizer(args)
+        prompt_token_ids = make_synthetic_prompt_ids(tokenizer, args.prompt_len)
+        prompt_tokens = len(prompt_token_ids)
+        prompts = [{"prompt_token_ids": list(prompt_token_ids)} for _ in range(args.batch_size)]
+    except RuntimeError as exc:
+        print(f"Initialization failed: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    warmup_params = build_trtllm_sampling_params(
+        max_new_tokens=min(16, args.max_new_tokens),
+        seed=args.seed,
+    )
+    benchmark_params = build_trtllm_sampling_params(
+        max_new_tokens=args.max_new_tokens,
+        seed=args.seed,
+    )
+
+    print(
+        f"Warmup: {args.warmup_iters} iters | Benchmark: {args.benchmark_iters} iters | "
+        f"backend=trtllm model={args.model} dtype={args.dtype} batch_size={args.batch_size}"
+    )
+    for i in range(args.warmup_iters):
+        try:
+            gen_ms, outputs = time_trtllm_generate(llm, prompts, warmup_params)
+            generated_tokens, total_generated_tokens = extract_trtllm_generated_tokens(outputs)
+            e2e_tok_s = total_generated_tokens / (gen_ms / 1000.0) if gen_ms > 0 else 0.0
+            print(
+                f"warmup={i+1}/{args.warmup_iters} "
+                f"generate_ms={gen_ms:.2f} e2e_tok_s={e2e_tok_s:.2f} "
+                f"generated_tokens={generated_tokens}"
+            )
+        except RuntimeError as exc:
+            if "out of memory" in str(exc).lower():
+                print(
+                    "CUDA OOM during TensorRT-LLM warmup. Reduce --batch-size, "
+                    "--prompt-len, or --max-new-tokens.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            raise
+
+    metrics_list: list[IterationMetrics] = []
+    max_observed_mem_gb: float | None = get_child_worker_memory_gb()
+
+    for i in range(args.benchmark_iters):
+        try:
+            gen_ms, outputs = time_trtllm_generate(llm, prompts, benchmark_params)
+            generated_tokens, total_generated_tokens = extract_trtllm_generated_tokens(outputs)
+            prefill_ms, decode_ms = extract_trtllm_phase_timings(outputs)
+            current_mem_gb = get_child_worker_memory_gb()
+            if current_mem_gb is not None:
+                max_observed_mem_gb = (
+                    current_mem_gb
+                    if max_observed_mem_gb is None
+                    else max(max_observed_mem_gb, current_mem_gb)
+                )
+
+            decode_tok_s = (
+                total_generated_tokens / (decode_ms / 1000.0)
+                if decode_ms is not None and decode_ms > 0
+                else None
+            )
+            e2e_tok_s = total_generated_tokens / (gen_ms / 1000.0) if gen_ms > 0 else 0.0
+
+            iter_metrics = IterationMetrics(
+                backend="trtllm",
+                prefill_ms=prefill_ms,
+                decode_ms=decode_ms,
+                total_generate_ms=gen_ms,
+                decode_tokens_per_sec=decode_tok_s,
+                end_to_end_tokens_per_sec=e2e_tok_s,
+                prompt_tokens=prompt_tokens,
+                generated_tokens=generated_tokens,
+                batch_size=args.batch_size,
+                dtype=args.dtype,
+                model_name=args.model,
+                max_gpu_mem_gb=max_observed_mem_gb or 0.0,
+            )
+            metrics_list.append(iter_metrics)
+            _print_iteration(i + 1, iter_metrics)
+        except RuntimeError as exc:
+            if "out of memory" in str(exc).lower():
+                print(
+                    f"CUDA OOM on TensorRT-LLM benchmark iteration {i+1}. "
+                    "Try lowering --batch-size, --prompt-len, or --max-new-tokens.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            raise
+
+    return metrics_list
+
+
 def main():
     args = _build_arg_parser().parse_args()
 
@@ -730,8 +1010,10 @@ def main():
         metrics_list = run_hf_benchmark(args)
         if args.profile_decode:
             return
-    else:
+    elif args.backend == "vllm":
         metrics_list = run_vllm_benchmark(args)
+    else:
+        metrics_list = run_trtllm_benchmark(args)
 
     if not metrics_list:
         print("No benchmark iterations completed.", file=sys.stderr)
