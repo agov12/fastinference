@@ -171,6 +171,14 @@ def save_figure(fig, filename: str) -> None:
     plt.close(fig)
 
 
+def save_figure_variants(fig, filenames: list[str]) -> None:
+    PLOTS_DIR.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    for filename in filenames:
+        fig.savefig(PLOTS_DIR / filename, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
 def make_hf_phase_plots(hf_summaries: list[BenchmarkSummary]) -> None:
     prompt_fixed = by_batch_size(filter_summaries(hf_summaries, prompt_tokens=1024))
     x_batch = [summary.batch_size for summary in prompt_fixed]
@@ -319,7 +327,15 @@ def make_backend_comparison_plots(summaries_by_backend: dict[str, list[Benchmark
                 axis.set_xscale("log", base=2)
             axis.legend()
 
-        save_figure(fig, filename)
+        filenames = [filename]
+        if active_backends == BACKEND_ORDER:
+            explicit_filename = (
+                "hf_vs_vllm_vs_trtllm_prompt_tokens_comparison.png"
+                if x_is_prompt
+                else "hf_vs_vllm_vs_trtllm_batch_size_comparison.png"
+            )
+            filenames.append(explicit_filename)
+        save_figure_variants(fig, filenames)
 
     plot_grid("Batch Size", "backend_batch_size_comparison.png", x_is_prompt=False)
     plot_grid("Prompt Tokens", "backend_prompt_tokens_comparison.png", x_is_prompt=True)
