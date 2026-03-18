@@ -28,6 +28,7 @@ Example Nsight Systems profile runs (HF decode-focused only):
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import subprocess
@@ -60,6 +61,11 @@ class IterationMetrics:
     dtype: str
     model_name: str
     max_gpu_mem_gb: float
+    spec_acceptance_rate: float | None = None
+    spec_drafted_per_target_forward: float | None = None
+    spec_avg_accepted_tokens_per_verification: float | None = None
+    ttft_ms: float | None = None
+    inter_token_latency_ms: float | None = None
 
 
 def load_tokenizer(model_name: str):
@@ -87,6 +93,23 @@ def load_hf_model_and_tokenizer(model_name: str, dtype: str):
     model.to("cuda")
     model.eval()
     return model, tokenizer
+
+
+def load_hf_model_only(model_name: str, dtype: str):
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for this benchmark, but no GPU was detected.")
+
+    dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16}
+    if dtype not in dtype_map:
+        raise ValueError(f"Unsupported dtype '{dtype}'. Use one of: {list(dtype_map)}")
+
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=dtype_map[dtype],
+    )
+    model.to("cuda")
+    model.eval()
+    return model
 
 
 def load_vllm_engine_and_tokenizer(args):
@@ -199,16 +222,26 @@ def load_trtllm_engine_and_tokenizer(args):
             "TensorRT-LLM requires CUDA_HOME/CUDA_PATH or a pip-installed CUDA 13 toolkit."
         )
 
-    llm = LLM(
-        model=args.model,
-        tokenizer=args.model,
-        dtype=dtype_map[args.dtype],
-        tensor_parallel_size=1,
-        trust_remote_code=False,
-        max_batch_size=args.batch_size,
-        max_num_tokens=args.prompt_len + args.max_new_tokens,
-        max_seq_len=args.prompt_len + args.max_new_tokens,
-    )
+    llm_kwargs = {
+        "model": args.model,
+        "tokenizer": args.model,
+        "dtype": dtype_map[args.dtype],
+        "tensor_parallel_size": 1,
+        "trust_remote_code": False,
+        "max_batch_size": args.batch_size,
+        "max_num_tokens": args.prompt_len + args.max_new_tokens,
+        "max_seq_len": args.prompt_len + args.max_new_tokens,
+    }
+    if args.trtllm_speculative_draft_model is not None:
+        from tensorrt_llm.llmapi import DraftTargetDecodingConfig
+
+        llm_kwargs["backend"] = "pytorch"
+        llm_kwargs["speculative_config"] = DraftTargetDecodingConfig(
+            max_draft_len=args.trtllm_speculative_max_draft_len,
+            speculative_model_dir=args.trtllm_speculative_draft_model,
+        )
+
+    llm = LLM(**llm_kwargs)
     tokenizer = load_tokenizer(args.model)
     return llm, tokenizer
 
@@ -344,6 +377,260 @@ def time_generate(
             )
         )
     return ms, out
+
+
+def _crop_legacy_past_key_values(past_key_values, old_seq_len: int, new_seq_len: int):
+    if old_seq_len == new_seq_len:
+        return past_key_values
+
+    cropped_layers = []
+    for layer in past_key_values:
+        if not isinstance(layer, (list, tuple)):
+            cropped_layers.append(layer)
+            continue
+
+        cropped_items = []
+        for tensor in layer:
+            if not torch.is_tensor(tensor) or tensor.dim() < 3:
+                cropped_items.append(tensor)
+                continue
+
+            seq_dim = None
+            for idx, size in enumerate(tensor.shape):
+                if size == old_seq_len:
+                    seq_dim = idx
+            if seq_dim is None:
+                # Typical KV layouts use either dim=1 or dim=2 for sequence.
+                seq_dim = 2 if tensor.dim() > 2 else 1
+
+            slicer = [slice(None)] * tensor.dim()
+            slicer[seq_dim] = slice(0, new_seq_len)
+            cropped_items.append(tensor[tuple(slicer)].contiguous())
+
+        cropped_layers.append(tuple(cropped_items))
+
+    return tuple(cropped_layers)
+
+
+def _crop_past_key_values(past_key_values, old_seq_len: int, new_seq_len: int):
+    if old_seq_len == new_seq_len:
+        return past_key_values
+
+    if hasattr(past_key_values, "crop"):
+        past_key_values.crop(new_seq_len)
+        return past_key_values
+
+    if hasattr(past_key_values, "to_legacy_cache"):
+        legacy = past_key_values.to_legacy_cache()
+        return _crop_legacy_past_key_values(legacy, old_seq_len, new_seq_len)
+
+    return _crop_legacy_past_key_values(past_key_values, old_seq_len, new_seq_len)
+
+
+@contextlib.contextmanager
+def _nvtx_range(message: str, enabled: bool):
+    if not enabled:
+        yield
+        return
+
+    torch.cuda.nvtx.range_push(message)
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
+
+
+def time_speculative_generate(
+    target_model,
+    draft_model,
+    input_ids: torch.Tensor,
+    max_new_tokens: int,
+    speculative_k: int,
+    emit_nvtx: bool = False,
+):
+    if input_ids.size(0) != 1:
+        raise ValueError("Speculative decoding currently supports batch size 1 only.")
+    if max_new_tokens < 1:
+        return 0.0, input_ids, {"generated_tokens": 0, "acceptance_rate": 0.0, "drafted_per_target_forward": 0.0}
+
+    device = input_ids.device
+    mask_dtype = torch.long
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    torch.cuda.synchronize()
+    start.record()
+
+    with torch.no_grad():
+        with _nvtx_range("spec_generate", emit_nvtx):
+            current_ids = input_ids.clone()
+            seq_len = current_ids.size(1)
+
+            base_mask = torch.ones((1, seq_len), device=device, dtype=mask_dtype)
+            with _nvtx_range("spec_target_prefill", emit_nvtx):
+                target_prefill = target_model(
+                    input_ids=current_ids,
+                    attention_mask=base_mask,
+                    use_cache=True,
+                )
+            with _nvtx_range("spec_draft_prefill", emit_nvtx):
+                draft_prefill = draft_model(
+                    input_ids=current_ids,
+                    attention_mask=base_mask,
+                    use_cache=True,
+                )
+
+            target_past = target_prefill.past_key_values
+            draft_past = draft_prefill.past_key_values
+            draft_next = torch.argmax(draft_prefill.logits[:, -1, :], dim=-1, keepdim=True)
+
+            generated = 0
+            drafted = 0
+            accepted = 0
+            target_forwards = 1  # initial prefill
+            verification_passes = 0
+            token_events: list[torch.cuda.Event] = []
+
+            def _mark_tokens_emitted(count: int):
+                for _ in range(count):
+                    ev = torch.cuda.Event(enable_timing=True)
+                    ev.record()
+                    token_events.append(ev)
+
+            while generated < max_new_tokens:
+                block = min(speculative_k, max_new_tokens - generated)
+                old_seq_len = seq_len
+
+                proposal_tokens = []
+                with _nvtx_range("spec_draft_propose", emit_nvtx):
+                    for step in range(block):
+                        token = draft_next
+                        proposal_tokens.append(token)
+                        drafted += 1
+
+                        draft_mask = torch.ones(
+                            (1, old_seq_len + step + 1),
+                            device=device,
+                            dtype=mask_dtype,
+                        )
+                        draft_step = draft_model(
+                            input_ids=token,
+                            attention_mask=draft_mask,
+                            past_key_values=draft_past,
+                            use_cache=True,
+                        )
+                        draft_past = draft_step.past_key_values
+                        draft_next = torch.argmax(draft_step.logits[:, -1, :], dim=-1, keepdim=True)
+
+                proposal = torch.cat(proposal_tokens, dim=1)
+                verify_mask = torch.ones(
+                    (1, old_seq_len + block),
+                    device=device,
+                    dtype=mask_dtype,
+                )
+                with _nvtx_range("spec_target_verify", emit_nvtx):
+                    verify = target_model(
+                        input_ids=proposal,
+                        attention_mask=verify_mask,
+                        past_key_values=target_past,
+                        use_cache=True,
+                    )
+                target_forwards += 1
+                verification_passes += 1
+
+                target_preds = torch.argmax(verify.logits, dim=-1)
+                proposal_vec = proposal[0]
+                pred_vec = target_preds[0]
+
+                mismatch_index = None
+                for idx in range(block):
+                    if int(pred_vec[idx].item()) != int(proposal_vec[idx].item()):
+                        mismatch_index = idx
+                        break
+
+                if mismatch_index is None:
+                    current_ids = torch.cat([current_ids, proposal], dim=1)
+                    seq_len = old_seq_len + block
+                    generated += block
+                    accepted += block
+                    target_past = verify.past_key_values
+                    _mark_tokens_emitted(block)
+                    continue
+
+                accepted_in_block = mismatch_index
+                if accepted_in_block > 0:
+                    accepted_prefix = proposal[:, :accepted_in_block]
+                    current_ids = torch.cat([current_ids, accepted_prefix], dim=1)
+                    seq_len = old_seq_len + accepted_in_block
+                    generated += accepted_in_block
+                    accepted += accepted_in_block
+                    _mark_tokens_emitted(accepted_in_block)
+                else:
+                    seq_len = old_seq_len
+
+                corrected_token = pred_vec[mismatch_index].view(1, 1)
+                current_ids = torch.cat([current_ids, corrected_token], dim=1)
+                seq_len += 1
+                generated += 1
+                _mark_tokens_emitted(1)
+
+                target_past = _crop_past_key_values(
+                    verify.past_key_values,
+                    old_seq_len + block,
+                    old_seq_len + accepted_in_block,
+                )
+                corr_mask = torch.ones((1, seq_len), device=device, dtype=mask_dtype)
+                with _nvtx_range("spec_target_corrective", emit_nvtx):
+                    target_step = target_model(
+                        input_ids=corrected_token,
+                        attention_mask=corr_mask,
+                        past_key_values=target_past,
+                        use_cache=True,
+                    )
+                target_forwards += 1
+                target_past = target_step.past_key_values
+
+                draft_past = _crop_past_key_values(
+                    draft_past,
+                    old_seq_len + block,
+                    old_seq_len + accepted_in_block,
+                )
+                with _nvtx_range("spec_draft_corrective", emit_nvtx):
+                    draft_step = draft_model(
+                        input_ids=corrected_token,
+                        attention_mask=corr_mask,
+                        past_key_values=draft_past,
+                        use_cache=True,
+                    )
+                draft_past = draft_step.past_key_values
+                draft_next = torch.argmax(draft_step.logits[:, -1, :], dim=-1, keepdim=True)
+
+        end.record()
+    torch.cuda.synchronize()
+
+    total_ms = float(start.elapsed_time(end))
+
+    ttft_ms = float(start.elapsed_time(token_events[0])) if token_events else None
+    inter_token_latency_ms = None
+    if len(token_events) >= 2:
+        deltas = [token_events[i].elapsed_time(token_events[i + 1]) for i in range(len(token_events) - 1)]
+        inter_token_latency_ms = float(sum(deltas) / len(deltas))
+
+    acceptance_rate = (accepted / drafted) if drafted > 0 else 0.0
+    drafted_per_target_forward = drafted / target_forwards if target_forwards > 0 else 0.0
+    avg_accepted_tokens_per_verification = (
+        accepted / verification_passes if verification_passes > 0 else 0.0
+    )
+
+    return total_ms, current_ids, {
+        "generated_tokens": generated,
+        "acceptance_rate": acceptance_rate,
+        "drafted_per_target_forward": drafted_per_target_forward,
+        "avg_accepted_tokens_per_verification": avg_accepted_tokens_per_verification,
+        "ttft_ms": ttft_ms,
+        "inter_token_latency_ms": inter_token_latency_ms,
+    }
+
 
 
 def build_vllm_sampling_params(max_new_tokens: int, seed: int):
@@ -549,6 +836,11 @@ def summarize_results(all_iters: list[IterationMetrics]):
         dtype=sample.dtype,
         model_name=sample.model_name,
         max_gpu_mem_gb=float(statistics.mean([m.max_gpu_mem_gb for m in all_iters])),
+        spec_acceptance_rate=avg("spec_acceptance_rate"),
+        spec_drafted_per_target_forward=avg("spec_drafted_per_target_forward"),
+        spec_avg_accepted_tokens_per_verification=avg("spec_avg_accepted_tokens_per_verification"),
+        ttft_ms=avg("ttft_ms"),
+        inter_token_latency_ms=avg("inter_token_latency_ms"),
     )
     return summary
 
@@ -564,7 +856,7 @@ def _fmt_optional_float(value: float | None) -> str:
 
 
 def _print_iteration(idx: int, metrics: IterationMetrics):
-    print(
+    base = (
         f"iter={idx:02d} "
         f"prefill_ms={_fmt_optional_float(metrics.prefill_ms)} "
         f"decode_ms={_fmt_optional_float(metrics.decode_ms)} "
@@ -573,6 +865,15 @@ def _print_iteration(idx: int, metrics: IterationMetrics):
         f"e2e_tok_s={metrics.end_to_end_tokens_per_sec:.2f} "
         f"max_mem_gb={metrics.max_gpu_mem_gb:.2f}"
     )
+    if metrics.spec_acceptance_rate is not None:
+        base += (
+            f" spec_acceptance={metrics.spec_acceptance_rate:.3f}"
+            f" drafted_per_target_fwd={_fmt_optional_float(metrics.spec_drafted_per_target_forward)}"
+            f" avg_accept_per_verify={_fmt_optional_float(metrics.spec_avg_accepted_tokens_per_verification)}"
+            f" ttft_ms={_fmt_optional_float(metrics.ttft_ms)}"
+            f" inter_tok_ms={_fmt_optional_float(metrics.inter_token_latency_ms)}"
+        )
+    print(base)
 
 
 def _print_summary(summary: IterationMetrics):
@@ -601,6 +902,26 @@ def _print_summary(summary: IterationMetrics):
         )
     )
     print(_fmt_row("max_gpu_mem_allocated", f"{summary.max_gpu_mem_gb:.2f}", "GB"))
+    if summary.spec_acceptance_rate is not None:
+        print(_fmt_row("spec_acceptance_rate", f"{summary.spec_acceptance_rate:.3f}"))
+    if summary.spec_drafted_per_target_forward is not None:
+        print(
+            _fmt_row(
+                "spec_drafted_per_target_fwd",
+                f"{summary.spec_drafted_per_target_forward:.2f}",
+            )
+        )
+    if summary.spec_avg_accepted_tokens_per_verification is not None:
+        print(
+            _fmt_row(
+                "spec_avg_accept_per_verify",
+                f"{summary.spec_avg_accepted_tokens_per_verification:.2f}",
+            )
+        )
+    if summary.ttft_ms is not None:
+        print(_fmt_row("ttft_ms", f"{summary.ttft_ms:.2f}", "ms"))
+    if summary.inter_token_latency_ms is not None:
+        print(_fmt_row("inter_token_latency", f"{summary.inter_token_latency_ms:.2f}", "ms"))
 
 
 def _build_arg_parser():
@@ -642,6 +963,35 @@ def _build_arg_parser():
         help="vLLM only: disable CUDA graph capture and use eager execution only.",
     )
     parser.add_argument("--output-json", type=str, default=None)
+    parser.add_argument(
+        "--hf-speculative-draft-model",
+        type=str,
+        default=None,
+        help="HF only: optional draft model name for greedy speculative decoding.",
+    )
+    parser.add_argument(
+        "--hf-speculative-k",
+        type=int,
+        default=4,
+        help="HF only: number of draft tokens proposed per speculative step.",
+    )
+    parser.add_argument(
+        "--hf-speculative-nvtx",
+        action="store_true",
+        help="HF only: emit NVTX ranges around speculative draft/verify/corrective stages.",
+    )
+    parser.add_argument(
+        "--trtllm-speculative-draft-model",
+        type=str,
+        default=None,
+        help="TensorRT-LLM only: optional draft model path/name for native draft-target decoding.",
+    )
+    parser.add_argument(
+        "--trtllm-speculative-max-draft-len",
+        type=int,
+        default=4,
+        help="TensorRT-LLM only: max draft length for native draft-target decoding.",
+    )
     return parser
 
 
@@ -649,8 +999,27 @@ def run_hf_benchmark(args) -> list[IterationMetrics]:
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
 
+    if args.hf_speculative_draft_model is not None and args.batch_size != 1:
+        print(
+            "--hf-speculative-draft-model currently supports only --batch-size 1.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if args.hf_speculative_draft_model is not None and args.profile_decode:
+        print(
+            "--profile-decode is incompatible with HF speculative decoding mode.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if args.hf_speculative_k < 1:
+        print("--hf-speculative-k must be >= 1.", file=sys.stderr)
+        sys.exit(2)
+
+    draft_model = None
     try:
         model, tokenizer = load_hf_model_and_tokenizer(args.model, args.dtype)
+        if args.hf_speculative_draft_model is not None:
+            draft_model = load_hf_model_only(args.hf_speculative_draft_model, args.dtype)
         prompt_token_ids = make_synthetic_prompt_ids(tokenizer, args.prompt_len)
         input_ids, attention_mask, prompt_tokens = make_hf_batch(
             tokenizer=tokenizer,
@@ -713,26 +1082,48 @@ def run_hf_benchmark(args) -> list[IterationMetrics]:
         f"Warmup: {args.warmup_iters} iters | Benchmark: {args.benchmark_iters} iters | "
         f"backend=hf model={args.model} dtype={args.dtype} batch_size={args.batch_size}"
     )
+    if draft_model is not None:
+        print(
+            f"HF speculative mode enabled: draft_model={args.hf_speculative_draft_model} "
+            f"k={args.hf_speculative_k}"
+        )
     for i in range(args.warmup_iters):
         try:
-            prefill_ms, prefill_outputs = time_prefill(model, input_ids, attention_mask)
-            decode_ms, _ = time_manual_decode(
-                model=model,
-                prefill_outputs=prefill_outputs,
-                attention_mask=attention_mask,
-                max_new_tokens=min(16, args.max_new_tokens),
-            )
-            _ = time_generate(
-                model=model,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                max_new_tokens=min(16, args.max_new_tokens),
-                pad_token_id=tokenizer.pad_token_id,
-            )
-            print(
-                f"warmup={i+1}/{args.warmup_iters} "
-                f"prefill_ms={prefill_ms:.2f} decode_ms={decode_ms:.2f}"
-            )
+            if draft_model is None:
+                prefill_ms, prefill_outputs = time_prefill(model, input_ids, attention_mask)
+                decode_ms, _ = time_manual_decode(
+                    model=model,
+                    prefill_outputs=prefill_outputs,
+                    attention_mask=attention_mask,
+                    max_new_tokens=min(16, args.max_new_tokens),
+                )
+                _ = time_generate(
+                    model=model,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    max_new_tokens=min(16, args.max_new_tokens),
+                    pad_token_id=tokenizer.pad_token_id,
+                )
+                print(
+                    f"warmup={i+1}/{args.warmup_iters} "
+                    f"prefill_ms={prefill_ms:.2f} decode_ms={decode_ms:.2f}"
+                )
+            else:
+                warmup_gen = min(16, args.max_new_tokens)
+                gen_ms, _, stats = time_speculative_generate(
+                    target_model=model,
+                    draft_model=draft_model,
+                    input_ids=input_ids,
+                    max_new_tokens=warmup_gen,
+                    speculative_k=args.hf_speculative_k,
+                    emit_nvtx=args.hf_speculative_nvtx,
+                )
+                e2e_tok_s = warmup_gen / (gen_ms / 1000.0) if gen_ms > 0 else 0.0
+                print(
+                    f"warmup={i+1}/{args.warmup_iters} "
+                    f"generate_ms={gen_ms:.2f} e2e_tok_s={e2e_tok_s:.2f} "
+                    f"spec_acceptance={stats['acceptance_rate']:.3f}"
+                )
         except RuntimeError as exc:
             if "out of memory" in str(exc).lower():
                 print(
@@ -748,27 +1139,61 @@ def run_hf_benchmark(args) -> list[IterationMetrics]:
         try:
             torch.cuda.reset_peak_memory_stats()
 
-            prefill_ms, prefill_outputs = time_prefill(model, input_ids, attention_mask)
-            decode_ms, generated_tokens = time_manual_decode(
-                model=model,
-                prefill_outputs=prefill_outputs,
-                attention_mask=attention_mask,
-                max_new_tokens=args.max_new_tokens,
-            )
-            gen_ms, _ = time_generate(
-                model=model,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                max_new_tokens=args.max_new_tokens,
-                pad_token_id=tokenizer.pad_token_id,
-            )
+            spec_acceptance_rate = None
+            spec_drafted_per_target_forward = None
+            spec_avg_accepted_tokens_per_verification = None
+            ttft_ms = None
+            inter_token_latency_ms = None
+            if draft_model is None:
+                prefill_ms, prefill_outputs = time_prefill(model, input_ids, attention_mask)
+                decode_ms, generated_tokens = time_manual_decode(
+                    model=model,
+                    prefill_outputs=prefill_outputs,
+                    attention_mask=attention_mask,
+                    max_new_tokens=args.max_new_tokens,
+                )
+                gen_ms, _ = time_generate(
+                    model=model,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    max_new_tokens=args.max_new_tokens,
+                    pad_token_id=tokenizer.pad_token_id,
+                )
 
-            decode_toks_total = generated_tokens * args.batch_size
+                decode_toks_total = generated_tokens * args.batch_size
+                decode_tok_s = decode_toks_total / (decode_ms / 1000.0) if decode_ms > 0 else 0.0
+            else:
+                prefill_ms = None
+                decode_ms = None
+                decode_tok_s = None
+                generated_tokens = args.max_new_tokens
+                gen_ms, _, spec_stats = time_speculative_generate(
+                    target_model=model,
+                    draft_model=draft_model,
+                    input_ids=input_ids,
+                    max_new_tokens=args.max_new_tokens,
+                    speculative_k=args.hf_speculative_k,
+                    emit_nvtx=args.hf_speculative_nvtx,
+                )
+                spec_acceptance_rate = float(spec_stats["acceptance_rate"])
+                spec_drafted_per_target_forward = float(spec_stats["drafted_per_target_forward"])
+                spec_avg_accepted_tokens_per_verification = float(
+                    spec_stats["avg_accepted_tokens_per_verification"]
+                )
+                ttft_ms = (
+                    float(spec_stats["ttft_ms"])
+                    if spec_stats.get("ttft_ms") is not None
+                    else None
+                )
+                inter_token_latency_ms = (
+                    float(spec_stats["inter_token_latency_ms"])
+                    if spec_stats.get("inter_token_latency_ms") is not None
+                    else None
+                )
+
             e2e_toks_total = generated_tokens * args.batch_size
-
-            decode_tok_s = decode_toks_total / (decode_ms / 1000.0) if decode_ms > 0 else 0.0
-            e2e_tok_s = e2e_toks_total / (gen_ms / 1000.0) if gen_ms > 0 else 0.0
             max_mem_gb = torch.cuda.max_memory_allocated() / (1024**3)
+            e2e_tok_s = e2e_toks_total / (gen_ms / 1000.0) if gen_ms > 0 else 0.0
 
             iter_metrics = IterationMetrics(
                 backend="hf",
@@ -783,6 +1208,11 @@ def run_hf_benchmark(args) -> list[IterationMetrics]:
                 dtype=args.dtype,
                 model_name=args.model,
                 max_gpu_mem_gb=max_mem_gb,
+                spec_acceptance_rate=spec_acceptance_rate,
+                spec_drafted_per_target_forward=spec_drafted_per_target_forward,
+                spec_avg_accepted_tokens_per_verification=spec_avg_accepted_tokens_per_verification,
+                ttft_ms=ttft_ms,
+                inter_token_latency_ms=inter_token_latency_ms,
             )
             metrics_list.append(iter_metrics)
             _print_iteration(i + 1, iter_metrics)
@@ -906,6 +1336,9 @@ def run_trtllm_benchmark(args) -> list[IterationMetrics]:
     if args.profile_decode:
         print("--profile-decode is only supported with --backend hf.", file=sys.stderr)
         sys.exit(2)
+    if args.trtllm_speculative_max_draft_len < 1:
+        print("--trtllm-speculative-max-draft-len must be >= 1.", file=sys.stderr)
+        sys.exit(2)
 
     ensure_trtllm_runtime_ready_for_current_process()
 
@@ -931,6 +1364,12 @@ def run_trtllm_benchmark(args) -> list[IterationMetrics]:
         f"Warmup: {args.warmup_iters} iters | Benchmark: {args.benchmark_iters} iters | "
         f"backend=trtllm model={args.model} dtype={args.dtype} batch_size={args.batch_size}"
     )
+    if args.trtllm_speculative_draft_model is not None:
+        print(
+            "TensorRT-LLM native speculative mode enabled: "
+            f"draft_model={args.trtllm_speculative_draft_model} "
+            f"max_draft_len={args.trtllm_speculative_max_draft_len}"
+        )
     for i in range(args.warmup_iters):
         try:
             gen_ms, outputs = time_trtllm_generate(llm, prompts, warmup_params)

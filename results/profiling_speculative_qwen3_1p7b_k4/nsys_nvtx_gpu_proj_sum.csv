@@ -1,0 +1,10 @@
+Processing [results/profiling_speculative_qwen3_1p7b_k4/nsys_spec_qwen3_1p7b_k4_p4096_g128.sqlite] with [/opt/nvidia/nsight-systems/2025.6.3/host-linux-x64/reports/nvtx_gpu_proj_sum.py]... 
+Range,Style,Total Proj Time (ns),Total Range Time (ns),Range Instances,Proj Avg (ns),Proj Med (ns),Proj Min (ns),Proj Max (ns),Proj StdDev (ns),Total GPU Ops,Avg GPU Ops,Avg Range Lvl,Avg Num Child
+:spec_generate,PushPop,16355620819,16355917695,1,16355620819.0,16355620819.0,16355620819,16355620819,0.0,392752,392752.0,0.0,102.0
+:spec_draft_propose,PushPop,9969430534,9961237294,40,249235763.3,248846202.5,124654484,347686790,25703572.0,256276,6406.9,1.0,0.0
+:spec_target_verify,PushPop,3897170978,3873605243,40,97429274.5,94130745.5,92139967,217082879,19463027.6,94696,2367.4,1.0,0.0
+:spec_target_prefill,PushPop,870014413,675720758,1,870014413.0,870014413.0,870014413,870014413,0.0,2039,2039.0,1.0,0.0
+:spec_target_corrective,PushPop,829678433,823115577,10,82967843.3,81633574.5,81235834,92742456,3557172.5,21470,2147.0,1.0,0.0
+:spec_draft_corrective,PushPop,629309650,628838921,10,62930965.0,62240710.0,61852841,65308001,1292039.5,16190,1619.0,1.0,0.0
+:spec_draft_prefill,PushPop,123022789,261329617,1,123022789.0,123022789.0,123022789,123022789,0.0,1591,1591.0,1.0,0.0
+
